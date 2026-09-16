@@ -1,0 +1,9 @@
+# sandboxes and scratch from the tests
+_test/
+*.corrupt-*
+
+# editor / OS noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
