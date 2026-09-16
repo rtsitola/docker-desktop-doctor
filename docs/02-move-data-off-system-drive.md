@@ -96,5 +96,11 @@ cmd.exe /c 'C:\path\to\move.bat'
   The resulting distro fails with `execvpe(/bin/sh) failed: No such file or directory`.
   Let Docker Desktop recreate its own storage — it does that on start when a data disk is
   present at the path it expects.
+- **Do not run bare `wsl --unmount` while Docker Desktop is running.** With no argument it
+  detaches every attached disk in the utility VM, including the loop devices behind the
+  `docker-desktop` distro's system overlay. The engine then dies with
+  `fork/exec /usr/local/bin/dockerd: input/output error` — a message that has nothing to do with
+  daemon.json. Always pass the path: `wsl --unmount 'K:\...\docker_data.vhdx'`. Details and the
+  recovery in `03-inventory-orphan-vhdx.md`.
 - **Do not delete the old `docker_data.vhdx` before checking what is inside it.** See
   `03-inventory-orphan-vhdx.md`.

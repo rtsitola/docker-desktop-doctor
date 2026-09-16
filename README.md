@@ -206,6 +206,9 @@ Full protocol, measurements and the mechanism:
 - **no `.vhdx` is ever deleted or moved without an explicit copy + byte-for-byte verification**
 - nothing is unregistered: `wsl --unregister` on a Docker distro can take down the whole WSL
   subsystem, and this tool never uses it
+- it only ever runs `wsl --unmount <the exact file it attached>`, never bare — a bare
+  `wsl --unmount` detaches the `docker-desktop` distro's own system overlay and leaves the engine
+  unable to start (see [docs/03](docs/03-inventory-orphan-vhdx.md#%EF%B8%8F-never-run-bare-wsl---unmount-while-docker-desktop-is-running))
 
 ## Requirements
 

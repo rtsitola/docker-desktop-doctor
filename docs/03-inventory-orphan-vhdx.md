@@ -114,3 +114,36 @@ stat -c '%i liens=%h %n' a/model.safetensors b/model.safetensors
 # 2814749767394255 liens=3 a/model.safetensors
 # 2814749767394255 liens=3 b/model.safetensors     <- deleting one frees 0 bytes
 ```
+
+## ⚠️ Never run bare `wsl --unmount` while Docker Desktop is running
+
+`wsl --unmount` **with no argument detaches every attached disk and VHD in the utility VM** —
+including the loop devices carrying the `docker-desktop` distro's system overlay. The distro
+stays "Running" and looks healthy while its system tree disappears underneath it:
+
+```
+$ wsl -d docker-desktop -- ls -l /usr/local/bin/dockerd
+ls: /usr/local/bin/dockerd: No such file or directory
+```
+
+The engine then refuses to start, with a message pointing nowhere near the cause:
+
+```
+{"component":"init","level":"error","msg":"daemon.json validation failed:
+ daemon.json is invalid: : fork/exec /usr/local/bin/dockerd: input/output error"}
+```
+
+`fork/exec … input/output error` means the binary is no longer readable. It does **not** mean
+your `daemon.json` is corrupt — do not go editing configs over this message. Recovery is a clean
+restart (the data disk is untouched, no image or volume is lost):
+
+```powershell
+docker desktop stop
+Get-Process 'Docker Desktop','com.docker.backend','com.docker.build','docker-agent' `
+    -ErrorAction SilentlyContinue | Stop-Process -Force
+wsl --terminate docker-desktop
+Start-Process 'C:\Program Files\Docker\Docker\Docker Desktop.exe'
+```
+
+Always name the file: `wsl --unmount 'K:\...\docker_data.vhdx'` — which is what
+`scripts/inventory-docker-vhdx.sh` does, and only for the disk it attached itself.
