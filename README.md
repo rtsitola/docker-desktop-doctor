@@ -2,6 +2,10 @@
 
 **Docker Desktop ate 20 GB of my C: drive and never said a word. Here is what it was, and how to get it back.**
 
+<p align="center">
+  <img src="assets/docker-desktop-doctor.jpg" alt="docker-desktop-doctor: a diagnostic checklist card for Docker Desktop" width="360">
+</p>
+
 A read-only diagnostic for Windows that reports where the gigabytes actually went,
 flags the four failure modes that account for almost all of it, and repairs them on
 request. Tested against Docker Desktop 4.83.0 — the failure modes documented here were
@@ -184,6 +188,7 @@ tree, and report-only-by-default. No real Docker file is touched.
 docker-desktop-doctor.ps1          the tool (single file, no dependencies)
 tests/run-tests.ps1                sandboxed end-to-end tests
 scripts/inventory-docker-vhdx.sh   read-only inventory of an orphaned docker_data.vhdx
+assets/                            README illustration
 docs/01-crash-loop-zeroed-config.md
 docs/02-move-data-off-system-drive.md
 docs/03-inventory-orphan-vhdx.md
