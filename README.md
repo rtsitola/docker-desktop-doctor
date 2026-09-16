@@ -152,7 +152,50 @@ orphaned, Docker never touches it again, and it is usually the largest file you 
 A VHDX never shrinks after a prune: the file keeps the high-water mark of everything that was
 ever written. **A `.vhdx` file size is not the data size.** Inventory it read-only before
 deleting anything — `scripts/inventory-docker-vhdx.sh` does that and prints the volumes and
-container names it finds.
+container names it finds. To hand the slack back to Windows, see
+[Shrinking the data disk](#shrinking-the-data-disk-after-a-prune).
+
+## Shrinking the data disk after a prune
+
+```powershell
+docker desktop stop
+Optimize-VHD -Path "$env:LOCALAPPDATA\Docker\wsl\disk\docker_data.vhdx" -Mode Full   # Hyper-V feature + admin
+docker desktop start
+```
+
+No Hyper-V feature on your edition? `diskpart` does the same job:
+
+```bat
+:: compact.txt
+select vdisk file="C:\Users\<you>\AppData\Local\Docker\wsl\disk\docker_data.vhdx"
+attach vdisk readonly
+compact vdisk
+detach vdisk
+```
+```powershell
+docker desktop stop
+diskpart /s compact.txt          # from an elevated prompt
+docker desktop start
+```
+
+Optional, if you want the freed blocks offered to the disk first (needs Docker running):
+
+```powershell
+wsl -d docker-desktop -- fstrim -v /mnt/docker-desktop-disk
+```
+
+Do it detached (Docker stopped) and elevated. On a disk you care about, do it on a copy first —
+`robocopy` it out and compact the copy.
+
+**Expect modest numbers.** On a 19.2 GiB data disk here: **201 MiB reclaimed (1%)** —
+`diskpart` reported success each time. That disk was 80% payload with only ~3.7 GiB of slack,
+which is what a freshly rebuilt stack looks like; a disk that grew over months and was then
+pruned has more to give. The guest's `fstrim` is not propagated to the host file (it reported
+989 GiB trimmed and the file moved by 1 MiB — journal replay), so `compact vdisk` can only
+reclaim whatever the block map already considers free.
+
+Full protocol, measurements and the mechanism:
+[docs/04-shrink-the-data-disk.md](docs/04-shrink-the-data-disk.md).
 
 ## Safety model
 
@@ -192,6 +235,7 @@ assets/                            README illustration
 docs/01-crash-loop-zeroed-config.md
 docs/02-move-data-off-system-drive.md
 docs/03-inventory-orphan-vhdx.md
+docs/04-shrink-the-data-disk.md      why compaction returns 1%, measured
 docs/upstream-issue-draft.md       ready-to-file bug report for the unbounded error dump
 ```
 
