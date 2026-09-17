@@ -7,20 +7,25 @@
 .DESCRIPTION
     Docker Desktop on Windows can consume tens of gigabytes of a system drive
     without ever showing a warning. This script reports the real breakdown and
-    the four failure modes that account for almost all of it:
+    the five failure modes that account for almost all of it:
 
       1. A zeroed config file (all NUL bytes) that crash-loops com.docker.backend
       2. backend.error.json - an unbounded recursive crash dump (multi-GB)
       3. The WSL data disk (docker_data.vhdx) silently back on the system drive
          after a settings factory-reset
       4. Orphaned docker_data.vhdx files left behind on previous locations
+      5. The data disk failing to ATTACH (AttachDisk/E_ACCESSDENIED), which
+         Docker reports as a misleading "no sd* disk ... wwid ending by <guid>"
 
     Default mode is READ-ONLY: it reports and prints the commands to run.
     Nothing is modified unless you pass -Fix or -Relocate.
 
 .PARAMETER Fix
-    Quarantine corrupt config files and delete oversized error dumps.
-    Refuses to run while Docker Desktop is running. Never touches a .vhdx.
+    Quarantine corrupt config files, delete oversized error dumps, and - when
+    the logs show a failed data-disk attach - detach it with an explicit-path
+    "wsl --unmount <the exact vhdx>", which clears the state that made the
+    attach fail. Refuses to run while Docker Desktop is running. Never deletes
+    or moves a .vhdx, and never runs a bare "wsl --unmount".
 
 .PARAMETER Relocate
     Destination folder (for example K:\DOCKER). Copies the WSL data folder
@@ -52,7 +57,8 @@
 .NOTES
     Author: rtsitola - https://github.com/rtsitola/docker-desktop-doctor
     License: MIT
-    Tested on Docker Desktop 4.83.0 (Engine 29.6.2), Windows 11, WSL 2.7.14.
+    Tested on Docker Desktop 4.83.0 (Engine 29.6.2) and 4.91.0 (Engine 29.8.0),
+    Windows 11, WSL 2.7.14.
 #>
 [CmdletBinding()]
 param(
@@ -203,6 +209,87 @@ function Get-VhdxInfo {
         Bytes      = $fi.Length
         LastWrite  = $fi.LastWriteTime
         IsJunction = ($fi.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+    }
+}
+
+# Docker always logs the same misleading pair when the data disk cannot be
+# attached: the bootstrap reports 'no sd* disk in /sys/block with wwid ending
+# by <guid>', while the real error a few lines above is
+# AttachDisk/MountDisk/HCS/E_ACCESSDENIED on
+# 'wsl.exe --mount --bare --vhd <path>\docker_data.vhdx'.
+function Get-LogTailText {
+    param([string] $Path, [int] $Bytes = 262144)
+    try {
+        $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+    } catch {
+        return ''
+    }
+    try {
+        $len  = $fs.Length
+        $take = [int][Math]::Min($len, [long]$Bytes)
+        if ($take -le 0) { return '' }
+        $fs.Seek($len - $take, 'Begin') | Out-Null
+        $buf = New-Object byte[] $take
+        $null = $fs.Read($buf, 0, $take)
+        return [System.Text.Encoding]::UTF8.GetString($buf)
+    } finally {
+        $fs.Dispose()
+    }
+}
+
+function Get-AttachFailure {
+    $hostLog = Join-Path $dataRoot 'log\host'
+    if (-not (Test-Path -LiteralPath $hostLog)) { return $null }
+
+    $files = Get-ChildItem -LiteralPath $hostLog -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^(com\.docker\.backend\.exe|monitor)\.log' } |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 4
+
+    $denied = $false
+    $guid   = $null
+    $wwid   = $null
+    $vhdx   = $null
+    $stamp  = $null
+
+    foreach ($f in $files) {
+        $text = Get-LogTailText -Path $f.FullName
+        if (-not $text) { continue }
+
+        if (-not $denied -and $text -match 'AttachDisk/MountDisk/(?:HCS/)?E_ACCESSDENIED') {
+            $denied = $true
+            $m = [regex]::Match($text, '(?m)^\[(?<t>[^\]]{10,40})\][^\n]*E_ACCESSDENIED')
+            if ($m.Success) { $stamp = $m.Groups['t'].Value }
+        }
+
+        # the id Docker passes on the command line, exactly as its error dialog shows it
+        if (-not $guid) {
+            $m = [regex]::Match($text, '\-\-data-disk (?<g>[0-9a-fA-F]{8}-[0-9a-fA-F-]{20,30})')
+            if ($m.Success) { $guid = $m.Groups['g'].Value }
+        }
+
+        # what the bootstrap looked for in /sys/block (naa.60022480<hex>)
+        if (-not $wwid) {
+            $m = [regex]::Match($text, 'wwid ending by (?<w>[0-9a-fA-F]{16,40})')
+            if ($m.Success) { $wwid = $m.Groups['w'].Value }
+        }
+
+        if (-not $vhdx) {
+            # the log redacts the user name as <home>; keep only real paths
+            $m = [regex]::Match($text, '\-\-mount \-\-bare \-\-vhd (?<p>\S+?\.vhdx)')
+            if ($m.Success -and $m.Groups['p'].Value -notmatch '<') {
+                $vhdx = $m.Groups['p'].Value
+            }
+        }
+    }
+
+    if (-not $denied -and -not $wwid) { return $null }
+
+    [pscustomobject]@{
+        Denied    = $denied
+        Guid      = $guid
+        Wwid      = $wwid
+        Vhdx      = $vhdx
+        Timestamp = $stamp
     }
 }
 
@@ -380,10 +467,48 @@ if (Test-Path -LiteralPath $diskDir) {
 }
 
 # ---------------------------------------------------------------------------
-# 5. orphaned data disks
+# 5. data-disk attach (the failure Docker reports as "no sd* disk")
 # ---------------------------------------------------------------------------
 
-Section '5. Orphaned data disks'
+Section '5. Will the engine be able to attach its data disk?'
+
+$attach = Get-AttachFailure
+
+if ($attach -and $attach.Denied) {
+    $ids = ''
+    if ($attach.Guid) { $ids = '  data disk id: ' + $attach.Guid }
+    $when = ''
+    if ($attach.Timestamp) { $when = "  [last seen $($attach.Timestamp)]" }
+
+    Finding 'CRITICAL' 'The data disk could not be attached - the engine never started' `
+        ("wsl.exe --mount --bare --vhd <data disk>  ->  Wsl/Service/AttachDisk/MountDisk/HCS/E_ACCESSDENIED$ids$when") `
+        'This is the real error. The bootstrap line "no sd* disk in /sys/block with wwid ending by <hex>" is only its symptom. -Fix detaches the disk so the next start can attach it.'
+
+    $cmdPath = $attach.Vhdx
+    $default = Join-Path $wslRoot 'disk\docker_data.vhdx'
+    if (Test-Path -LiteralPath $default) { $cmdPath = $default }
+    if (-not $cmdPath) { $cmdPath = $default }
+
+    Say '' 
+    Say '             docker desktop stop' 'Gray'
+    Say ("             wsl --unmount `"$cmdPath`"") 'Gray'
+    Say '             docker desktop start' 'Gray'
+    Say '             (explicit path: a bare "wsl --unmount" detaches the distro itself)' 'DarkGray'
+    Say '             Then "docker ps -a": your containers must come back - that is the proof' 'DarkGray'
+    Say '             the data disk (and not a fresh empty one) is the one attached.' 'DarkGray'
+} elseif ($attach -and $attach.Wwid) {
+    Finding 'CRITICAL' 'Docker looked for a data disk that is not attached' `
+        ("bootstrap: no sd* disk in /sys/block with wwid ending by " + $attach.Wwid + " - and no attach error logged") `
+        'Either a different vhdx is in use, or the disk was never attached. Cross-check with: wsl.exe -d docker-desktop -u root -- sh -c "grep -r . /sys/block/sd*/device/wwid"'
+} else {
+    Finding 'OK' 'No failed data-disk attach in the recent logs' 'The bootstrap never reported "no sd* disk ... wwid ending by <hex>".'
+}
+
+# ---------------------------------------------------------------------------
+# 6. orphaned data disks
+# ---------------------------------------------------------------------------
+
+Section '6. Orphaned data disks'
 
 if ($ScanDrives) {
     $found = @()
@@ -467,6 +592,31 @@ function Invoke-Fix {
                 Finding 'CRITICAL' 'Could not delete crash dump' "$errDump : $($_.Exception.Message)"
             }
         }
+    }
+
+    # Clear a stuck data-disk attachment: that is the state that makes the next
+    # attach fail with AttachDisk/E_ACCESSDENIED. Explicit path only - a bare
+    # "wsl --unmount" also detaches the distro's own system overlay.
+    if ($attach -and $attach.Denied) {
+        $detach  = $attach.Vhdx
+        $default = Join-Path $wslRoot 'disk\docker_data.vhdx'
+        if (Test-Path -LiteralPath $default) { $detach = $default }
+        if (-not $detach) { $detach = $default }
+
+        $wsl = Join-Path $env:SystemRoot 'System32\wsl.exe'
+        if (-not (Test-Path -LiteralPath $wsl)) {
+            Finding 'WARN' 'wsl.exe not found' 'Detach the data disk by hand: wsl --unmount "<exact vhdx path>"'
+        } elseif (-not (Test-Path -LiteralPath $detach)) {
+            Finding 'WARN' 'No data disk found at the expected path - nothing to detach' $detach
+        } else {
+            $out = & $wsl --unmount $detach 2>&1 | Out-String
+            if ($LASTEXITCODE -eq 0) {
+                Finding 'OK' 'Data disk detached' ("wsl --unmount `"$detach`" - the next start can attach it again")
+            } else {
+                Finding 'WARN' 'Detach returned a non-zero status' (($out.Trim() -replace '\s+', ' ')) 'Harmless when the disk was not attached. Start Docker Desktop and check "docker ps -a".'
+            }
+        }
+        Finding 'INFO' 'Watch the attach step' 'Start Docker Desktop: E_ACCESSDENIED must disappear from %LOCALAPPDATA%\Docker\log\host\com.docker.backend.exe.log.'
     }
 
     Finding 'INFO' 'Next' 'Start Docker Desktop, then "docker version" must show a Server section (that means the backend came up).'

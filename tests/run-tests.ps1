@@ -55,7 +55,7 @@ function Get-SandboxRunner {
 `$env:USERPROFILE  = '$Sandbox\profile'
 `$env:APPDATA      = '$Sandbox\roaming'
 `$env:LOCALAPPDATA = '$Sandbox\local'
-& '$doctor'
+& '$doctor' @args
 "@
     Set-Content -LiteralPath $wrapper -Value $content -Encoding ASCII
     return $wrapper
@@ -186,6 +186,68 @@ if (Test-Path -LiteralPath (Join-Path $sb 'profile\.docker\windows-daemon.json')
     $script:Passed++
 } else {
     Write-Host '  FAIL  the zeroed file was modified without -Fix' -ForegroundColor Red
+    $script:Failed++
+}
+
+# --- T11: a failed data-disk attach is flagged (the "no sd* disk" cause) -----
+Write-Host ''
+Write-Host '  T11 attach denied: E_ACCESSDENIED behind "no sd* disk"' -ForegroundColor Cyan
+$sb = New-Sandbox
+$log = @'
+[2026-09-17T19:58:19.291618100Z][com.docker.backend.exe.engines][E] attempting to recover from error: mounting data disk: mounting WSL VHDX: running wslexec: Access is denied. Wsl/Service/AttachDisk/MountDisk/HCS/E_ACCESSDENIED: wsl.exe --mount --bare --vhd C:\Users\me\AppData\Local\Docker\wsl\disk\docker_data.vhdx
+[2026-09-17T19:58:18.820783436Z][wsl-bootstrap] provisioning data via data disk with id: 3d3e456b-bbac-304a-ba1e-99ef61f785ae
+[2026-09-17T19:58:18.832396803Z][wsl-bootstrap] disk not found: no sd* disk in /sys/block with wwid ending by 3d3e456bbbac99ef61f785ae: file does not exist. Retrying in 100ms (attempt 3 of 3)
+[2026-09-17T19:58:25.979924900Z][com.docker.backend.exe.ipc] GET /error: {"error":"running wslexec: wsl.exe -d docker-desktop -u root -e wsl-bootstrap run --base-image /c/program files/docker/docker/resources/docker-desktop.iso --data-disk 3d3e456b-bbac-304a-ba1e-99ef61f785ae: exit status 1"}
+'@
+Set-Content -LiteralPath (Join-Path $sb 'local\Docker\log\host\com.docker.backend.exe.log') -Value $log -Encoding ASCII
+$out = Invoke-Doctor -Sandbox $sb
+Assert-Contains $out 'could not be attached' 'flags the failed attach'
+Assert-Contains $out 'E_ACCESSDENIED' 'names the real error'
+Assert-Contains $out '3d3e456b-bbac-304a-ba1e-99ef61f785ae' 'reports the data disk id'
+Assert-Contains $out 'last seen 2026-09-17T19:58:19' 'timestamps the last failure'
+Assert-Contains $out 'wsl --unmount' 'prints the explicit-path detach'
+Assert-Contains $out 'explicit path' 'warns against a bare unmount'
+Assert-Contains $out 'No change was made' 'still read-only'
+
+# --- T12: a healthy host log raises nothing --------------------------------
+Write-Host ''
+Write-Host '  T12 healthy host log (no false positive)' -ForegroundColor Cyan
+$sb = New-Sandbox
+$log = @'
+[2026-09-17T20:11:50.485649975Z][wsl-bootstrap] provisioning data via data disk with id: 3d3e456b-bbac-304a-ba1e-99ef61f785ae
+[2026-09-17T20:11:51.000000000Z][wsl-bootstrap] data disk attached
+'@
+Set-Content -LiteralPath (Join-Path $sb 'local\Docker\log\host\com.docker.backend.exe.log') -Value $log -Encoding ASCII
+$out = Invoke-Doctor -Sandbox $sb
+Assert-Contains $out 'No failed data-disk attach' 'stays quiet on a clean log'
+
+# --- T13: -Fix detaches with an explicit path (or refuses while running) ----
+Write-Host ''
+Write-Host '  T13 -Fix: explicit-path detach, never a bare unmount' -ForegroundColor Cyan
+$sb = New-Sandbox
+Set-Content -LiteralPath (Join-Path $sb 'local\Docker\log\host\com.docker.backend.exe.log') -Value $log -Encoding ASCII
+New-SizedFile -Path (Join-Path $sb 'local\Docker\wsl\disk\docker_data.vhdx') -Bytes 1MB
+$wrapper = Get-SandboxRunner -Sandbox $sb
+$fixOut = & powershell -NoProfile -ExecutionPolicy Bypass -File $wrapper -Fix 2>&1 | Out-String
+$refused  = $fixOut -like '*Docker Desktop is running*'
+$attempted = ($fixOut -like '*Data disk detached*') -or ($fixOut -like '*Detach returned a non-zero status*')
+if ($refused -or $attempted) {
+    Write-Host ("  PASS  -Fix either refused safely (running) or attempted the detach: {0}" -f $(if ($refused) { 'refused' } else { 'attempted' })) -ForegroundColor Green
+    $script:Passed++
+} else {
+    Write-Host '  FAIL  -Fix neither refused nor detached' -ForegroundColor Red
+    Write-Host '        ---- output ----' -ForegroundColor DarkGray
+    $fixOut -split "`n" | Select-Object -First 40 | ForEach-Object { Write-Host "        $_" -ForegroundColor DarkGray }
+    $script:Failed++
+}
+if ($refused) {
+    Write-Host '  PASS  no bare "wsl --unmount" was attempted (nothing changed)' -ForegroundColor Green
+    $script:Passed++
+} elseif ($fixOut -match 'wsl --unmount "') {
+    Write-Host '  PASS  the detach always names the file' -ForegroundColor Green
+    $script:Passed++
+} else {
+    Write-Host '  FAIL  a detach ran without an explicit path' -ForegroundColor Red
     $script:Failed++
 }
 

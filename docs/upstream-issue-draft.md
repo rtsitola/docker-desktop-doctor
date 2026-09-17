@@ -1,7 +1,11 @@
-# Upstream issue draft (docker/for-win)
+# Upstream issue drafts (docker/for-win)
 
 > Status: **draft, not filed.** The commands and numbers below were observed on a real machine.
 > Re-verify the byte counts on the reporting machine before filing.
+
+---
+
+# Draft 1 — `backend.error.json` has no size cap
 
 **Suggested title**
 
@@ -83,5 +87,83 @@ docker desktop start
 The config file is optional — Docker rewrites a clean one and starts normally. Containers,
 images and volumes are untouched.
 
-A diagnostic/repair tool for this and the three other storage failure modes:
+---
+
+# Draft 2 — a failed VHD attach is reported as "no sd* disk … wwid ending by <hex>"
+
+**Suggested title**
+
+`failed to attach the data disk` is reported as `no sd* disk in /sys/block with wwid ending by
+<hex>`, pointing users at the wrong fix (factory reset)
+
+**Environment**
+
+- Docker Desktop 4.91.0 (239619), engine 29.8.0
+- Windows 11 (26200.9457), WSL 2.7.14.0, kernel 6.18.33.2
+- WSL 2 backend; data folder relocated to another drive via an NTFS junction
+
+**Description**
+
+When the data disk cannot be attached, the error surfaced to the user (dialog + logs) is the
+bootstrap's *consequence*, not the cause:
+
+```
+DockerDesktop/Wsl/ExecError: wsl.exe -d docker-desktop -u root -e wsl-bootstrap run
+  --base-image /c/program files/docker/docker/resources/docker-desktop.iso
+  --data-disk 3d3e456b-bbac-304a-ba1e-99ef61f785ae: exit status 1
+  [wsl-bootstrap] provisioning data via data disk with id: 3d3e456b-bbac-304a-ba1e-99ef61f785ae
+  [wsl-bootstrap] disk not found: no sd* disk in /sys/block with wwid ending by
+                  3d3e456bbbac99ef61f785ae: file does not exist
+  Error: preparing environment: provisioning data: detecting disk: no sd* disk ...: file does not exist
+```
+
+`no sd* disk … wwid ending by <hex>` reads as *"the data disk is gone"*, so the user's
+reasonable next step is the only other button in the dialog: **Reset to factory defaults**,
+which deletes every image, container and volume — for a disk that is perfectly intact.
+
+The actual error is only in `%LOCALAPPDATA%\Docker\log\host\com.docker.backend.exe.log`, a few
+records above:
+
+```
+mounting data disk: mounting WSL VHDX: running wslexec: Access is denied.
+Wsl/Service/AttachDisk/MountDisk/HCS/E_ACCESSDENIED:
+wsl.exe --mount --bare --vhd C:\Users\<you>\AppData\Local\Docker\wsl\disk\docker_data.vhdx
+```
+
+**Verified on the affected machine**
+
+- the vhdx exists, is 20 604 518 400 bytes, opens exclusively (no lock held by any process)
+- the disk id Docker asks for is the disk in place: `naa.600224803d3e456bbbac99ef61f785ae`
+- the junction to the other drive is intact (`LinkType: Junction`), the volume is Healthy
+- the same attach succeeds by hand, non-elevated: `wsl --mount --bare --vhd "<path>"` →
+  *L'opération a réussi*
+
+The stuck state is the utility VM's attachment bookkeeping (observed after a backend
+crash-loop). `wsl --unmount "<the exact vhdx>"` clears it, and the next start attaches the
+same disk and brings all containers and volumes back.
+
+**Expected**
+
+- the user-visible error should carry the attach failure (`E_ACCESSDENIED` on
+  `--mount --bare --vhd <path>`), not only the downstream "disk not found"
+- a misdiagnosed unrecoverable state should not be the one that offers "Reset to factory
+  defaults" as its remedy
+- the two log lines are enough to detect this automatically: the repair could be attempted
+  before the engine is declared dead
+
+**Workaround (verified)**
+
+```powershell
+docker desktop stop
+wsl --unmount "C:\Users\<you>\AppData\Local\Docker\wsl\disk\docker_data.vhdx"   # explicit path
+docker desktop start
+docker ps -a      # containers back = the right disk was attached
+```
+
+Never a bare `wsl --unmount`: it also detaches the `docker-desktop` distro's own system
+overlay and leaves the engine unable to start.
+
+---
+
+A diagnostic/repair tool for this and the four other storage failure modes:
 https://github.com/rtsitola/docker-desktop-doctor

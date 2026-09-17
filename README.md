@@ -7,9 +7,9 @@
 </p>
 
 A read-only diagnostic for Windows that reports where the gigabytes actually went,
-flags the four failure modes that account for almost all of it, and repairs them on
-request. Tested against Docker Desktop 4.83.0 — the failure modes documented here were
-reproduced from scratch, with the log lines and byte counts included.
+flags the five failure modes that account for almost all of it, and repairs them on
+request. Tested against Docker Desktop 4.83.0 and 4.91.0 — the failure modes documented
+here were reproduced from scratch, with the log lines and byte counts included.
 
 ```
   [CRITICAL] Windows engine daemon config is ZEROED (all NUL bytes)
@@ -18,6 +18,10 @@ reproduced from scratch, with the log lines and byte counts included.
   [CRITICAL] backend.error.json is huge
              4.75 GB  - a recursively nested error dump
              -> Write-only file, Docker never reads it back. Delete it: -Fix
+  [CRITICAL] The data disk could not be attached - the engine never started
+             wsl.exe --mount --bare --vhd <data disk> -> ...AttachDisk/MountDisk/HCS/E_ACCESSDENIED
+             data disk id: 3d3e456b-bbac-304a-ba1e-99ef61f785ae  [last seen 2026-09-17T19:58:19.291618100Z]
+             -> docker desktop stop; wsl --unmount "<exact vhdx>"; docker desktop start
   [OK      ] Data folder is already redirected
              junction -> K:\DOCKER\wsl\disk
 ```
@@ -41,7 +45,7 @@ volume — then quietly puts the data folder back on the drive you were trying t
 # also hunt for orphaned data disks on every fixed drive (slower)
 .\docker-desktop-doctor.ps1 -ScanDrives
 
-# repair: quarantine corrupt configs, delete the crash dump
+# repair: quarantine corrupt configs, delete the crash dump, clear a stuck disk attach
 docker desktop stop
 .\docker-desktop-doctor.ps1 -Fix
 
@@ -51,7 +55,7 @@ docker desktop stop
 ```
 
 Default mode is **read-only**. It refuses to `-Fix` or `-Relocate` while Docker Desktop is
-running, and it never touches a `.vhdx` file.
+running, and it never deletes or moves a `.vhdx` file.
 
 ## What it checks
 
@@ -61,7 +65,8 @@ running, and it never touches a `.vhdx` file.
 | 2 | `.docker\windows-daemon.json`, `.docker\daemon.json`, `settings-store.json`: missing / empty / **zeroed** / malformed / valid | a zeroed config is the #1 cause of the backend crash-loop |
 | 3 | `backend.error.json` size + the config path the backend blamed; rotated host logs | the multi-GB file, and its actual root cause |
 | 4 | WSL distro base paths, `docker_data.vhdx` size, and whether the data folder is a junction | is the data really where you think it is |
-| 5 | Orphaned `docker_data.vhdx` on every fixed drive (`-ScanDrives`) | silent relocation leaves the old disk behind, forever |
+| 5 | Host logs for a failed data-disk attach (`AttachDisk … E_ACCESSDENIED`, `no sd* disk … wwid ending by <hex>`) | the misleading message that makes people wipe a healthy install |
+| 6 | Orphaned `docker_data.vhdx` on every fixed drive (`-ScanDrives`) | silent relocation leaves the old disk behind, forever |
 
 ---
 
@@ -155,6 +160,44 @@ deleting anything — `scripts/inventory-docker-vhdx.sh` does that and prints th
 container names it finds. To hand the slack back to Windows, see
 [Shrinking the data disk](#shrinking-the-data-disk-after-a-prune).
 
+## Failure mode 5 — the data disk cannot be attached, and Docker blames the disk
+
+The engine never starts, and the error you are shown points at the wrong thing:
+
+```
+[wsl-bootstrap] provisioning data via data disk with id: 3d3e456b-bbac-304a-ba1e-99ef61f785ae
+[wsl-bootstrap] disk not found: no sd* disk in /sys/block with wwid ending by
+                3d3e456bbbac99ef61f785ae: file does not exist. Retrying in 100ms (attempt 3 of 3)
+Error: preparing environment: provisioning data: detecting disk: no sd* disk ...: file does not exist
+```
+
+`no sd* disk … wwid ending by <hex>` reads like *"your data disk is gone"*, and the dialog's
+other button is *Reset to factory defaults*. Both are wrong. The bootstrap is reporting the
+**absence of a block device that an earlier step failed to attach**, and the real error is a
+few records above in `%LOCALAPPDATA%\Docker\log\host\com.docker.backend.exe.log`:
+
+```
+mounting data disk: mounting WSL VHDX: running wslexec: Access is denied.
+Wsl/Service/AttachDisk/MountDisk/HCS/E_ACCESSDENIED:
+wsl.exe --mount --bare --vhd C:\Users\<you>\AppData\Local\Docker\wsl\disk\docker_data.vhdx
+```
+
+The disk is fine — its id is the one Docker asks for, no process holds it, and the very same
+attach succeeds by hand. What is stuck is the **attach state inside the WSL utility VM** (a
+previous crash-loop, or a read-only inventory mount that was never detached, is the usual
+way in). Clear it by name:
+
+```powershell
+docker desktop stop
+wsl --unmount "C:\Users\<you>\AppData\Local\Docker\wsl\disk\docker_data.vhdx"   # explicit path only
+docker desktop start
+docker ps -a        # your containers coming back is the proof the right disk attached
+```
+
+`-Fix` does exactly this, and only this: it never deletes, moves or compacts a `.vhdx`, never
+runs a bare `wsl --unmount`, and never unregisters a distro. Full evidence table — what was
+ruled out and how — in [docs/05](docs/05-attach-denied-stale-attachment.md).
+
 ## Shrinking the data disk after a prune
 
 ```powershell
@@ -201,9 +244,11 @@ Full protocol, measurements and the mechanism:
 
 - **read-only by default** — the report never writes anything
 - `-Fix` and `-Relocate` **refuse to run while Docker Desktop is running**
-- `-Fix` only ever *renames* a corrupt config (to `*.corrupt-<timestamp>`) and deletes the
-  write-only crash dump
-- **no `.vhdx` is ever deleted or moved without an explicit copy + byte-for-byte verification**
+- `-Fix` only ever *renames* a corrupt config (to `*.corrupt-<timestamp>`), deletes the
+  write-only crash dump, and — when the logs show a failed attach — runs
+  `wsl --unmount "<the exact vhdx>"` to clear the stuck attachment state
+- **no `.vhdx` is ever deleted, moved or compacted**, and none is touched without an explicit
+  copy + byte-for-byte verification when relocating
 - nothing is unregistered: `wsl --unregister` on a Docker distro can take down the whole WSL
   subsystem, and this tool never uses it
 - it only ever runs `wsl --unmount <the exact file it attached>`, never bare — a bare
@@ -213,9 +258,10 @@ Full protocol, measurements and the mechanism:
 ## Requirements
 
 Windows 10/11, PowerShell 5.1+, Docker Desktop using the WSL 2 backend.
-`-ScanDrives` and `-Relocate` need no administrator rights (junctions do not).
-Verified on Docker Desktop **4.83.0 (234302)**, engine **29.6.2**, WSL **2.7.14**,
-kernel **6.18.33.2**.
+`-Fix`, `-ScanDrives` and `-Relocate` need no administrator rights (junctions and
+`wsl --unmount` do not either).
+Verified on Docker Desktop **4.83.0 (234302)**, engine **29.6.2**, and Docker Desktop
+**4.91.0 (239619)**, engine **29.8.0**, WSL **2.7.14**, kernel **6.18.33.2**.
 
 ## Tests
 
@@ -223,10 +269,12 @@ kernel **6.18.33.2**.
 powershell -ExecutionPolicy Bypass -File tests\run-tests.ps1
 ```
 
-Ten scenarios, each in a throw-away sandbox with `USERPROFILE`/`APPDATA`/`LOCALAPPDATA`
-redirected, asserting on the report text: zeroed config, empty config, malformed JSON, valid
-configs, oversized dump, small dump, factory-reset settings, junction detection, healthy
-tree, and report-only-by-default. No real Docker file is touched.
+Thirteen scenarios (26 assertions), each in a throw-away sandbox with
+`USERPROFILE`/`APPDATA`/`LOCALAPPDATA` redirected, asserting on the report text: zeroed
+config, empty config, malformed JSON, valid configs, oversized dump, small dump,
+factory-reset settings, junction detection, healthy tree, report-only-by-default, a failed
+data-disk attach in the host log, a healthy host log (no false positive), and `-Fix` doing
+nothing but an explicit-path detach. No real Docker file is touched.
 
 ## Repository layout
 
@@ -239,6 +287,7 @@ docs/01-crash-loop-zeroed-config.md
 docs/02-move-data-off-system-drive.md
 docs/03-inventory-orphan-vhdx.md
 docs/04-shrink-the-data-disk.md      why compaction returns 1%, measured
+docs/05-attach-denied-stale-attachment.md   "no sd* disk" is not a missing disk
 docs/upstream-issue-draft.md       ready-to-file bug report for the unbounded error dump
 ```
 

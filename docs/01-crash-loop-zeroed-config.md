@@ -95,6 +95,8 @@ Server: Docker Desktop 4.83.0 (234302)
 
 ## Why the doctor checks this first
 
-This is the only one of the four failure modes that makes Docker look *broken* rather than
-merely *fat*, and it is the one where the officially offered remedy destroys data. A NUL-byte
-probe plus a JSON parse is enough to catch it before anyone clicks reset.
+This is the most destructive of the five failure modes — the other one that makes Docker look
+*broken* ([a failed data-disk attach](05-attach-denied-stale-attachment.md)) is non-destructive,
+and the remaining three only make the install *fat*. Here the officially offered remedy
+destroys data. A NUL-byte probe plus a JSON parse is enough to catch it before anyone clicks
+reset.
